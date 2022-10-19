@@ -1,0 +1,6 @@
+host="ativarsoft.com.br"
+port=12008
+user="mateus"
+password="Sgramosgrafters2+@"
+timeout=10000
+max_connections=1

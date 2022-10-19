@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <assert.h>
 #include "resilient.h"
 
 #define BUFFER_SIZE 128
@@ -24,6 +25,7 @@ typedef struct {
 extern FILE *yyin;
 
 int term = 0;
+int timeout_ms = 0;
 ssh_session session = NULL;
 thread_array_t threads;
 
@@ -32,6 +34,7 @@ const char *config_user = NULL;
 const char *config_password = NULL;
 int config_timeout = 0;
 int config_max_connections = 100;
+int config_port = 12005;
 
 int create_thread_array(size_t num_threads, thread_array_t *arr)
 {
@@ -58,6 +61,20 @@ void destroy_thread_array(thread_array_t *arr)
 		free(threads);
 	}
 	arr->length = 0;
+}
+
+pthread_t thread_array_get(thread_array_t *arr, size_t index)
+{
+	size_t length = arr->length;
+	assert(index < length);
+	return arr->ptr[index];
+}
+
+void thread_array_set(thread_array_t *arr, size_t index, pthread_t value)
+{
+	size_t length = arr->length;
+	assert(index < length);
+	arr->ptr[index] = value;
 }
 
 int create_connection_thread_context(conn_ptr_t *p)
@@ -96,14 +113,19 @@ void close_config_file(FILE *file)
 	fclose(file);
 }
 
+static char *get_string(const char *value)
+{
+	return strndup(&value[1], strlen(value) - 2);
+}
+
 int set_config_option_string(const char *name, const char *value)
 {
 	if (strcasecmp(name, "host") == 0) {
-		config_host = strdup(value);
+		config_host = get_string(value);
 	} else if (strcasecmp(name, "user") == 0) {
-		config_user = strdup(value);
+		config_user = get_string(value);
 	} else if (strcasecmp(name, "password") == 0) {
-		config_password = strdup(value);
+		config_password = get_string(value);
 	} else {
 		fprintf(stderr, "warning: unknown string configururation option: %s\n", name);
 	}
@@ -124,6 +146,12 @@ int set_config_option_int(const char *name, int value)
 			return 1;
 		}
 		config_max_connections = value;
+	} else if (strcasecmp(name, "port") == 0) {
+		if (value > 0xffff) {
+			fprintf(stderr, "error: invalid port number\n");
+			return 1;
+		}
+		config_port = value;
 	} else {
 		fprintf(stderr, "warning: unknown integer configururation option: %s\n", name);
 	}
@@ -132,15 +160,30 @@ int set_config_option_int(const char *name, int value)
 
 static void shutdown_tunnel()
 {
-	term = 1;
+	size_t i = 0;
+	pthread_t thread;
+
+	if (!term) {
+		printf("Shutting down SSH tunnel.\n");
+		term = 1;
+		for (i = 0; i < threads.length; i++) {
+			thread = thread_array_get(&threads, i);
+			thread_array_set(&threads, i, 0);
+			if (thread)
+				pthread_cancel(thread);
+		}
+	} else {
+		exit(1);
+	}
 }
 
 /* Signal handler */
 static void signal_handler(int signum)
 {
-  printf("Shutting down SSH tunnel.\n");
   switch (signum) {
     case SIGTERM:
+    case SIGINT:
+    case SIGQUIT:
     shutdown_tunnel();
     break;
 
@@ -156,19 +199,21 @@ static void setup_signal_handler()
   memset(&action, 0, sizeof(action));
   action.sa_handler = &signal_handler;
   sigaction(SIGTERM, &action, NULL);
+  sigaction(SIGINT, &action, NULL);
+  sigaction(SIGQUIT, &action, NULL);
 }
 
-void *connection_thread(void *vargp)
+void *connection_thread(void *arg)
 {
   char buffer[BUFFER_SIZE] = {};
   int nbytes = 0;
-  conn_ptr_t conn = (conn_ptr_t) vargp;
+  conn_ptr_t conn = (conn_ptr_t) arg;
   ssh_channel channel = conn->channel;
   int i = 0;
 
-  for (;;)
+  while (!term)
   {
-    nbytes = ssh_channel_read(channel, buffer, sizeof(buffer), 0);
+    nbytes = ssh_channel_read_timeout(channel, buffer, sizeof(buffer), 0, config_timeout);
     if (nbytes < 0)
     {
       fprintf(stderr, "Error reading incoming data: %s\n",
@@ -206,6 +251,7 @@ int main()
 {
   int rc;
   int port = 0;
+  int bound_port = 0;
   pthread_t thread_id = 0;
   FILE *config_file = NULL;
   conn_ptr_t conn = NULL;
@@ -230,9 +276,11 @@ int main()
   read_config_file();
   
   host = config_host;
+  port = config_port;
   user = config_user;
   password = config_password;
-  timeout = config_timeout;
+  timeout_ms = config_timeout;
+  timeout = timeout_ms * 1000;
   max_connections = config_max_connections;
   
   setup_signal_handler();
@@ -251,8 +299,16 @@ int main()
   ssh_options_set(session, SSH_OPTIONS_USER, user);
   ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
   ssh_options_set(session, SSH_OPTIONS_CIPHERS_C_S, "aes128-ctr,aes256-ctr,3des-cbc");
+  ssh_options_set(session, SSH_OPTIONS_TIMEOUT_USEC, &timeout);
 
-  rc = ssh_connect(session);
+  ssh_set_blocking(session, 1);
+  
+  printf("Connecting to %s:%d...\n", host, port);
+
+  rc = SSH_ERROR;
+  do {
+    rc = ssh_connect(session);
+  } while (rc == SSH_AGAIN);
   if (rc != SSH_OK)
   {
     fprintf(stderr, "Error connecting: %s\n", ssh_get_error(session));
@@ -260,19 +316,7 @@ int main()
     return 1;
   }
 
-  /* open port on the remote server (the server
-   * with static IP. */
-  /* Apache will connect to this port with
-   * mod_proxy. */
-  rc = ssh_channel_listen_forward(session, NULL, 12004, NULL);
-  if (rc != SSH_OK)
-  {
-    fprintf(stderr, "Error opening remote port: %s\n",
-            ssh_get_error(session));
-    return rc;
-  }
-
-  rc = ssh_userauth_password(session, NULL, password);
+  rc = ssh_userauth_password(session, user, password);
   if (rc != SSH_AUTH_SUCCESS)
   {
     fprintf(stderr, "Error authenticating with password: %s\n",
@@ -282,14 +326,34 @@ int main()
     return 1;
   }
 
+  /* open port on the remote server (the server
+   * with static IP. */
+  /* Apache will connect to this port with
+   * mod_proxy. */
+  printf("Opening port %d on the remote server...\n", port);
+  do {
+    rc = ssh_channel_listen_forward(session, host, port, &bound_port);
+  } while (rc == SSH_AGAIN);
+  if (rc != SSH_OK)
+  {
+    fprintf(stderr, "Error opening remote port: %s\n",
+            ssh_get_error(session));
+    return rc;
+  }
+  if (bound_port != port) {
+	  fprintf(stderr, "warning: bound to port %d instead of the requested port %d\n", bound_port, port);
+  }
+
+  term = 0;
   while (!term) {
     /* port to connect on the server behind NAT */
-    channel = ssh_channel_accept_forward(session, timeout, &port);
+    channel = ssh_channel_accept_forward(session, timeout_ms, &port);
     if (channel == NULL)
     {
       fprintf(stderr, "Error waiting for incoming connection: %s\n",
               ssh_get_error(session));
       //return SSH_ERROR;
+      continue;
     }
     rc = create_connection_thread_context(&conn);
     if (rc){
@@ -301,15 +365,16 @@ int main()
 		/* drop connection */
 		continue;
 	}
-    pthread_create(&thread_id, NULL, &connection_thread, NULL);
+    pthread_create(&thread_id, NULL, &connection_thread, conn);
     threads.ptr[i] = thread_id;
     //pthread_detach(thread_id);
   }
-  for (i = 0; i < threads.length; i++) {
-    if ((thread_id = threads.ptr[i])) {
+  /*for (i = 0; i < threads.length; i++) {
+    thread_id = thread_array_get(&threads, i);
+    if (thread_id != 0) {
       pthread_join(thread_id, NULL);
     }
-  }
+  }*/
 
   ssh_disconnect(session);
   ssh_free(session);

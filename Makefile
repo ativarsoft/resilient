@@ -1,6 +1,6 @@
 EXEC=resilient
 
-CFLAGS=-Wall -Wextra
+CFLAGS=-Wall -Wextra -ggdb
 
 all: $(EXEC)
 
